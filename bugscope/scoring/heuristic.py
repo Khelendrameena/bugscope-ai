@@ -43,8 +43,8 @@ class HeuristicScorer(BaseScorer):
         # SSRF: url/redirect params
         if any(k in ep.params for k in ["url", "redirect", "callback", "webhook"]):
             scores["ssrf"] += 0.5
-        # Info disclosure: debug, config, .git paths
-        if any(k in url for k in ["debug", "config", ".git", "backup", "test"]):
+        # Info disclosure: debug, config, .git paths (word boundaries to avoid "testing" matching "test")
+        if re.search(r"[./_-](debug|config|\.git|backup|test)([./_-]|$)", url):
             scores["info_disclosure"] += 0.5
         if ep.source == "robots":
             scores["info_disclosure"] += 0.2
@@ -52,6 +52,14 @@ class HeuristicScorer(BaseScorer):
         if ep.source == "js" and "/api/" in url:
             for k in scores:
                 scores[k] += 0.1
+        # Deprioritize static content pages (blog, news, marketing) - not bug targets
+        if re.search(r"/(blog|news|clp|press|about|contact|careers|docs|help|faq)(/|$)", url):
+            for k in scores:
+                scores[k] *= 0.3
+        # Boost API-like endpoints
+        if "/api/" in url:
+            for k in scores:
+                scores[k] = min(scores[k] * 1.3, 0.95)
         # Clamp
         scores = {k: min(v, 0.95) for k, v in scores.items()}
         top = max(scores.items(), key=lambda x: x[1])
