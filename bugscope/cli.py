@@ -4,6 +4,13 @@ import asyncio
 import json
 import os
 import sys
+import time
+
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
 
 from .models import ScoredEndpoint
 from .recon.crawler import Crawler
@@ -15,9 +22,11 @@ from .scoring.heuristic import HeuristicScorer
 
 
 async def run_scan(target: str, scorer_name: str, max_pages: int) -> list[ScoredEndpoint]:
+    start = time.time()
     print(f"[+] Recon on {target} ...", file=sys.stderr)
     crawler = Crawler(target, max_pages=max_pages)
     crawled = await crawler.crawl()
+    print(f"    [{time.time()-start:.0f}s] Crawled {len(crawled)} pages", file=sys.stderr)
     print(f"[+] Crawled {len(crawled)} pages/forms", file=sys.stderr)
 
     extractor = Extractor(target)
@@ -65,7 +74,11 @@ async def run_full_scope(
 
     all_results = []
     all_secrets = []
-    for sd in subdomains:
+    start = time.time()
+    sd_iter = subdomains
+    if HAS_TQDM:
+        sd_iter = tqdm(subdomains, desc="Subdomains", unit="domain")
+    for sd in sd_iter:
         sd_url = f"https://{sd}"
         print(f"\n[+] Scanning {sd_url} ...", file=sys.stderr)
         try:
@@ -88,7 +101,12 @@ async def run_full_scope(
             # Secrets are extracted during JS parsing (added to endpoint context)
 
             sub_eps = crawled + extra + js_eps + sensitive
-            print(f"    Found {len(sub_eps)} endpoints", file=sys.stderr)
+            elapsed = time.time() - start
+            msg = f"    [{elapsed:.0f}s] {sd}: {len(sub_eps)} endpoints (total: {len(all_results)})"
+            if HAS_TQDM:
+                sd_iter.set_postfix_str(f"{len(all_results)} eps, {elapsed:.0f}s")
+            else:
+                print(msg, file=sys.stderr)
 
             # Score
             if scorer_name == "jev":
