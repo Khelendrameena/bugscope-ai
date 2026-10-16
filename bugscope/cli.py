@@ -72,53 +72,77 @@ async def run_full_scope(
     for sd in subdomains[:20]:
         print(f"    - {sd}", file=sys.stderr)
 
+    # DNS pre-filter: only scan subdomains that actually resolve (kills dead ones fast)
+    print(f"[+] DNS filtering {len(subdomains)} subdomains ...", file=sys.stderr)
+    import socket
+    async def _resolves(host: str) -> bool:
+        try:
+            await asyncio.get_event_loop().run_in_executor(
+                None, socket.gethostbyname, host
+            )
+            return True
+        except Exception:
+            return False
+    resolved = []
+    # Check in batches to avoid overwhelming DNS
+    for i in range(0, len(subdomains), 50):
+        batch = subdomains[i:i+50]
+        results = await asyncio.gather(*[_resolves(sd) for sd in batch])
+        resolved.extend([sd for sd, ok in zip(batch, results) if ok])
+        if HAS_TQDM:
+            print(f"    [{i+len(batch)}/{len(subdomains)}] {len(resolved)} alive",
+                  file=sys.stderr, end="\r")
+    # Cap at 50 to keep scan time reasonable
+    live = resolved[:50]
+    print(f"\n[+] {len(live)} live subdomains (from {len(subdomains)} total)",
+          file=sys.stderr)
+
+    # Pick scorer once
+    if scorer_name == "jev":
+        from .scoring.jev import JevScorer
+        scorer = JevScorer()
+    else:
+        scorer = HeuristicScorer()
+
     all_results = []
     all_secrets = []
     start = time.time()
-    sd_iter = subdomains
-    if HAS_TQDM:
-        sd_iter = tqdm(subdomains, desc="Subdomains", unit="domain")
-    for sd in sd_iter:
-        sd_url = f"https://{sd}"
-        print(f"\n[+] Scanning {sd_url} ...", file=sys.stderr)
-        try:
-            # Recon per subdomain
-            crawler = Crawler(sd_url, max_pages=max_pages // 2)
-            crawled = await crawler.crawl()
-            extractor = Extractor(sd_url)
-            extra = await extractor.extract()
-            js_parser = JSParser(sd_url)
-            js_eps = await js_parser.extract([e.url for e in crawled])
 
-            # Sensitive files
-            fs = FileScanner(sd_url)
-            sensitive = await fs.check_sensitive_files()
-            if sensitive:
-                print(f"    [!] {len(sensitive)} sensitive files exposed!",
-                      file=sys.stderr)
+    async def _scan_one(sd: str, sem: asyncio.Semaphore):
+        async with sem:
+            sd_url = f"https://{sd}"
+            try:
+                crawler = Crawler(sd_url, max_pages=max_pages // 3)
+                crawled = await crawler.crawl()
+                extractor = Extractor(sd_url)
+                extra = await extractor.extract()
+                js_parser = JSParser(sd_url)
+                js_eps = await js_parser.extract([e.url for e in crawled])
+                fs = FileScanner(sd_url)
+                sensitive = await fs.check_sensitive_files()
+                sub_eps = crawled + extra + js_eps + sensitive
+                scored = await scorer.score(sub_eps)
+                return scored, len(sub_eps), None
+            except Exception as e:
+                return [], 0, str(e)
 
-            # Source maps (need JS URLs - approximate from crawled)
-            # Secrets are extracted during JS parsing (added to endpoint context)
-
-            sub_eps = crawled + extra + js_eps + sensitive
+    # Parallel: 8 subdomains at once
+    sem = asyncio.Semaphore(8)
+    pbar = tqdm(total=len(live), desc="Scanning", unit="domain") if HAS_TQDM else None
+    async def _wrapped(sd):
+        r = await _scan_one(sd, sem)
+        if pbar:
             elapsed = time.time() - start
-            msg = f"    [{elapsed:.0f}s] {sd}: {len(sub_eps)} endpoints (total: {len(all_results)})"
-            if HAS_TQDM:
-                sd_iter.set_postfix_str(f"{len(all_results)} eps, {elapsed:.0f}s")
-            else:
-                print(msg, file=sys.stderr)
-
-            # Score
-            if scorer_name == "jev":
-                from .scoring.jev import JevScorer
-                scorer = JevScorer()
-            else:
-                scorer = HeuristicScorer()
-            scored = await scorer.score(sub_eps)
-            all_results.extend(scored)
-        except Exception as e:
-            print(f"    [!] Failed: {e}", file=sys.stderr)
-            continue
+            pbar.set_postfix_str(f"{len(all_results)} eps, {elapsed:.0f}s")
+            pbar.update(1)
+        else:
+            print(f"    [{sd}] {r[1]} endpoints", file=sys.stderr)
+        return r
+    scan_results = await asyncio.gather(*[_wrapped(sd) for sd in live])
+    if pbar:
+        pbar.close()
+    for scored, _, _ in scan_results:
+        all_results.extend(scored)
 
     # Global dedupe and sort
     seen, unique = set(), []
