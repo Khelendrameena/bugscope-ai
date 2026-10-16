@@ -29,3 +29,13 @@ Without a key, uses the built-in heuristic scorer (no API needed).
 python -m bugscope dashboard report.json
 # Open http://localhost:8080
 ```
+
+## Full Scope Scan
+
+```bash
+python -m bugscope full-scope https://target.com -o report.json
+```
+
+This enumerates ALL subdomains (via CT logs + DNS brute force), then scans
+each one: routes, JS files, sensitive files (`.git/HEAD`, `.env`, etc.),
+source maps, and hardcoded secrets (AWS keys, GitHub tokens, etc.).
